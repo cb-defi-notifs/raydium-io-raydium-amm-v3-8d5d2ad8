@@ -921,7 +921,7 @@ pub fn update_position(
 }
 
 const METADATA_URI: &str =
-    "https://cloudflare-ipfs.com/ipfs/QmbzJafuKY3B4t25eq9zdKZMgXiMeW4jHLzf6KE6ZmHWn1/02.json";
+    "https://dynamic-ipfs.raydium.io/clmm/position?id=9aFsTEEQDvHmnRz5H1kYcvbGQUkJ9YvPamtZ9hox2LZr";
 
 fn create_nft_with_metadata<'info>(
     payer: &Signer<'info>,
