@@ -61,7 +61,7 @@ pub enum ErrorCode {
     #[msg("Too much input paid")]
     TooMuchInputPaid,
     #[msg("Swap special amount can not be zero")]
-    InvaildSwapAmountSpecified,
+    ZeroAmountSpecified,
     #[msg("Input pool vault is invalid")]
     InvalidInputPoolVault,
     #[msg("Swap input or output amount is too small")]
@@ -94,4 +94,15 @@ pub enum ErrorCode {
     NotApproveUpdateRewardEmissiones,
     #[msg("uninitialized reward info")]
     UnInitializedRewardInfo,
+
+    #[msg("Not support token_2022 mint extension")]
+    NotSupportMint,
+    #[msg("Missing tickarray bitmap extension account")]
+    MissingTickArrayBitmapExtensionAccount,
+    #[msg("Insufficient liquidity for this direction")]
+    InsufficientLiquidityForDirection,
+    #[msg("Max token overflow")]
+    MaxTokenOverflow,
+    #[msg("calculate overflow")]
+    CalculateOverflow,
 }

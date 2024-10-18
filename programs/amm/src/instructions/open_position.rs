@@ -1,47 +1,21 @@
 use crate::error::ErrorCode;
 use crate::libraries::liquidity_math;
+use crate::libraries::tick_math;
 use crate::states::*;
 use crate::util::*;
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token;
-use anchor_spl::token::{Mint, Token, TokenAccount};
+use anchor_spl::metadata::Metadata;
+use anchor_spl::token::{self, Token};
+use anchor_spl::token_2022::{self, spl_token_2022::instruction::AuthorityType};
+use anchor_spl::token_interface::{Mint, Token2022, TokenAccount};
 use mpl_token_metadata::{instruction::create_metadata_accounts_v3, state::Creator};
-use spl_token::instruction::AuthorityType;
 use std::cell::RefMut;
 #[cfg(feature = "enable-log")]
 use std::convert::identity;
 use std::ops::Deref;
-
-pub struct AddLiquidityParam<'b, 'info> {
-    /// Pays to mint liquidity
-    pub payer: &'b Signer<'info>,
-
-    /// The token account spending token_0 to mint the position
-    pub token_account_0: &'b mut Box<Account<'info, TokenAccount>>,
-
-    /// The token account spending token_1 to mint the position
-    pub token_account_1: &'b mut Box<Account<'info, TokenAccount>>,
-
-    /// The address that holds pool tokens for token_0
-    pub token_vault_0: &'b mut Box<Account<'info, TokenAccount>>,
-
-    /// The address that holds pool tokens for token_1
-    pub token_vault_1: &'b mut Box<Account<'info, TokenAccount>>,
-
-    /// The bitmap storing initialization state of the lower tick
-    pub tick_array_lower: &'b AccountLoader<'info, TickArrayState>,
-
-    /// The bitmap storing initialization state of the upper tick
-    pub tick_array_upper: &'b AccountLoader<'info, TickArrayState>,
-
-    /// The position into which liquidity is minted
-    pub protocol_position: &'b mut Box<Account<'info, ProtocolPositionState>>,
-
-    /// The SPL program to perform token transfers
-    pub token_program: Program<'info, Token>,
-}
+use std::ops::DerefMut;
 
 #[derive(Accounts)]
 #[instruction(tick_lower_index: i32, tick_upper_index: i32,tick_array_lower_start_index:i32,tick_array_upper_start_index:i32)]
@@ -58,18 +32,21 @@ pub struct OpenPosition<'info> {
         init,
         mint::decimals = 0,
         mint::authority = pool_state.key(),
-        payer = payer
+        payer = payer,
+        mint::token_program = token_program,
     )]
-    pub position_nft_mint: Box<Account<'info, Mint>>,
+    pub position_nft_mint: Box<InterfaceAccount<'info, Mint>>,
 
     /// Token account where position NFT will be minted
+    /// This account created in the contract by cpi to avoid large stack variables
     #[account(
         init,
         associated_token::mint = position_nft_mint,
         associated_token::authority = position_nft_owner,
-        payer = payer
+        payer = payer,
+        token::token_program = token_program,
     )]
-    pub position_nft_account: Box<Account<'info, TokenAccount>>,
+    pub position_nft_account: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// To store metaplex metadata
     /// CHECK: Safety check performed inside function body
@@ -134,28 +111,28 @@ pub struct OpenPosition<'info> {
         mut,
         token::mint = token_vault_0.mint
     )]
-    pub token_account_0: Box<Account<'info, TokenAccount>>,
+    pub token_account_0: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// The token_1 account deposit token to the pool
     #[account(
         mut,
         token::mint = token_vault_1.mint
     )]
-    pub token_account_1: Box<Account<'info, TokenAccount>>,
+    pub token_account_1: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// The address that holds pool tokens for token_0
     #[account(
         mut,
         constraint = token_vault_0.key() == pool_state.load()?.token_vault_0
     )]
-    pub token_vault_0: Box<Account<'info, TokenAccount>>,
+    pub token_vault_0: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// The address that holds pool tokens for token_1
     #[account(
         mut,
         constraint = token_vault_1.key() == pool_state.load()?.token_vault_1
     )]
-    pub token_vault_1: Box<Account<'info, TokenAccount>>,
+    pub token_vault_1: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// Sysvar for token mint and ATA creation
     pub rent: Sysvar<'info, Rent>,
@@ -165,17 +142,178 @@ pub struct OpenPosition<'info> {
 
     /// Program to create mint account and mint tokens
     pub token_program: Program<'info, Token>,
-
     /// Program to create an ATA for receiving position NFT
     pub associated_token_program: Program<'info, AssociatedToken>,
 
     /// Program to create NFT metadata
     /// CHECK: Metadata program address constraint applied
-    #[account(address = mpl_token_metadata::ID)]
-    pub metadata_program: UncheckedAccount<'info>,
+    pub metadata_program: Program<'info, Metadata>,
+    // remaining account
+    // #[account(
+    //     seeds = [
+    //         POOL_TICK_ARRAY_BITMAP_SEED.as_bytes(),
+    //         pool_state.key().as_ref(),
+    //     ],
+    //     bump
+    // )]
+    // pub tick_array_bitmap: AccountLoader<'info, TickArrayBitmapExtension>,
 }
 
-pub fn open_position<'a, 'b, 'c, 'info>(
+#[derive(Accounts)]
+#[instruction(tick_lower_index: i32, tick_upper_index: i32,tick_array_lower_start_index:i32,tick_array_upper_start_index:i32)]
+pub struct OpenPositionV2<'info> {
+    /// Pays to mint the position
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// CHECK: Receives the position NFT
+    pub position_nft_owner: UncheckedAccount<'info>,
+
+    /// Unique token mint address
+    #[account(
+        init,
+        mint::decimals = 0,
+        mint::authority = pool_state.key(),
+        payer = payer,
+        mint::token_program = token_program,
+    )]
+    pub position_nft_mint: Box<InterfaceAccount<'info, Mint>>,
+
+    /// Token account where position NFT will be minted
+    /// This account created in the contract by cpi to avoid large stack variables
+    #[account(
+        init,
+        associated_token::mint = position_nft_mint,
+        associated_token::authority = position_nft_owner,
+        payer = payer,
+        token::token_program = token_program,
+    )]
+    pub position_nft_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// To store metaplex metadata
+    /// CHECK: Safety check performed inside function body
+    #[account(mut)]
+    pub metadata_account: UncheckedAccount<'info>,
+
+    /// Add liquidity for this pool
+    #[account(mut)]
+    pub pool_state: AccountLoader<'info, PoolState>,
+
+    /// Store the information of market marking in range
+    #[account(
+        init_if_needed,
+        seeds = [
+            POSITION_SEED.as_bytes(),
+            pool_state.key().as_ref(),
+            &tick_lower_index.to_be_bytes(),
+            &tick_upper_index.to_be_bytes(),
+        ],
+        bump,
+        payer = payer,
+        space = ProtocolPositionState::LEN
+    )]
+    pub protocol_position: Box<Account<'info, ProtocolPositionState>>,
+
+    /// CHECK: Account to mark the lower tick as initialized
+    #[account(
+        mut,
+        seeds = [
+            TICK_ARRAY_SEED.as_bytes(),
+            pool_state.key().as_ref(),
+            &tick_array_lower_start_index.to_be_bytes(),
+        ],
+        bump,
+    )]
+    pub tick_array_lower: UncheckedAccount<'info>,
+
+    /// CHECK:Account to store data for the position's upper tick
+    #[account(
+        mut,
+        seeds = [
+            TICK_ARRAY_SEED.as_bytes(),
+            pool_state.key().as_ref(),
+            &tick_array_upper_start_index.to_be_bytes(),
+        ],
+        bump,
+    )]
+    pub tick_array_upper: UncheckedAccount<'info>,
+
+    /// personal position state
+    #[account(
+        init,
+        seeds = [POSITION_SEED.as_bytes(), position_nft_mint.key().as_ref()],
+        bump,
+        payer = payer,
+        space = PersonalPositionState::LEN
+    )]
+    pub personal_position: Box<Account<'info, PersonalPositionState>>,
+
+    /// The token_0 account deposit token to the pool
+    #[account(
+        mut,
+        token::mint = token_vault_0.mint
+    )]
+    pub token_account_0: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// The token_1 account deposit token to the pool
+    #[account(
+        mut,
+        token::mint = token_vault_1.mint
+    )]
+    pub token_account_1: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// The address that holds pool tokens for token_0
+    #[account(
+        mut,
+        constraint = token_vault_0.key() == pool_state.load()?.token_vault_0
+    )]
+    pub token_vault_0: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// The address that holds pool tokens for token_1
+    #[account(
+        mut,
+        constraint = token_vault_1.key() == pool_state.load()?.token_vault_1
+    )]
+    pub token_vault_1: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// Sysvar for token mint and ATA creation
+    pub rent: Sysvar<'info, Rent>,
+
+    /// Program to create the position manager state account
+    pub system_program: Program<'info, System>,
+
+    /// Program to create mint account and mint tokens
+    pub token_program: Program<'info, Token>,
+    /// Program to create an ATA for receiving position NFT
+    pub associated_token_program: Program<'info, AssociatedToken>,
+
+    /// Program to create NFT metadata
+    /// CHECK: Metadata program address constraint applied
+    pub metadata_program: Program<'info, Metadata>,
+    /// Program to create mint account and mint tokens
+    pub token_program_2022: Program<'info, Token2022>,
+    /// The mint of token vault 0
+    #[account(
+        address = token_vault_0.mint
+    )]
+    pub vault_0_mint: Box<InterfaceAccount<'info, Mint>>,
+    /// The mint of token vault 1
+    #[account(
+        address = token_vault_1.mint
+    )]
+    pub vault_1_mint: Box<InterfaceAccount<'info, Mint>>,
+    // remaining account
+    // #[account(
+    //     seeds = [
+    //         POOL_TICK_ARRAY_BITMAP_SEED.as_bytes(),
+    //         pool_state.key().as_ref(),
+    //     ],
+    //     bump
+    // )]
+    // pub tick_array_bitmap: AccountLoader<'info, TickArrayBitmapExtension>,
+}
+
+pub fn open_position_v1<'a, 'b, 'c: 'info, 'info>(
     ctx: Context<'a, 'b, 'c, 'info, OpenPosition<'info>>,
     liquidity: u128,
     amount_0_max: u64,
@@ -184,9 +322,137 @@ pub fn open_position<'a, 'b, 'c, 'info>(
     tick_upper_index: i32,
     tick_array_lower_start_index: i32,
     tick_array_upper_start_index: i32,
+    with_matedata: bool,
+    base_flag: Option<bool>,
 ) -> Result<()> {
+    open_position(
+        &ctx.accounts.payer,
+        &ctx.accounts.position_nft_owner,
+        &ctx.accounts.position_nft_mint,
+        &ctx.accounts.position_nft_account,
+        &ctx.accounts.metadata_account,
+        &ctx.accounts.pool_state,
+        &ctx.accounts.tick_array_lower,
+        &ctx.accounts.tick_array_upper,
+        &mut ctx.accounts.protocol_position,
+        &mut ctx.accounts.personal_position,
+        &ctx.accounts.token_account_0,
+        &ctx.accounts.token_account_1,
+        &ctx.accounts.token_vault_0,
+        &ctx.accounts.token_vault_1,
+        &ctx.accounts.rent,
+        &ctx.accounts.system_program,
+        &ctx.accounts.token_program,
+        &ctx.accounts.associated_token_program,
+        &ctx.accounts.metadata_program,
+        None,
+        None,
+        None,
+        &ctx.remaining_accounts,
+        ctx.bumps.protocol_position,
+        ctx.bumps.personal_position,
+        liquidity,
+        amount_0_max,
+        amount_1_max,
+        tick_lower_index,
+        tick_upper_index,
+        tick_array_lower_start_index,
+        tick_array_upper_start_index,
+        with_matedata,
+        base_flag,
+    )
+}
+
+pub fn open_position_v2<'a, 'b, 'c: 'info, 'info>(
+    ctx: Context<'a, 'b, 'c, 'info, OpenPositionV2<'info>>,
+    liquidity: u128,
+    amount_0_max: u64,
+    amount_1_max: u64,
+    tick_lower_index: i32,
+    tick_upper_index: i32,
+    tick_array_lower_start_index: i32,
+    tick_array_upper_start_index: i32,
+    with_matedata: bool,
+    base_flag: Option<bool>,
+) -> Result<()> {
+    open_position(
+        &ctx.accounts.payer,
+        &ctx.accounts.position_nft_owner,
+        &ctx.accounts.position_nft_mint,
+        &ctx.accounts.position_nft_account,
+        &ctx.accounts.metadata_account,
+        &ctx.accounts.pool_state,
+        &ctx.accounts.tick_array_lower,
+        &ctx.accounts.tick_array_upper,
+        &mut ctx.accounts.protocol_position,
+        &mut ctx.accounts.personal_position,
+        &ctx.accounts.token_account_0,
+        &ctx.accounts.token_account_1,
+        &ctx.accounts.token_vault_0,
+        &ctx.accounts.token_vault_1,
+        &ctx.accounts.rent,
+        &ctx.accounts.system_program,
+        &ctx.accounts.token_program,
+        &ctx.accounts.associated_token_program,
+        &ctx.accounts.metadata_program,
+        Some(ctx.accounts.token_program_2022.clone()),
+        Some(ctx.accounts.vault_0_mint.clone()),
+        Some(ctx.accounts.vault_1_mint.clone()),
+        &ctx.remaining_accounts,
+        ctx.bumps.protocol_position,
+        ctx.bumps.personal_position,
+        liquidity,
+        amount_0_max,
+        amount_1_max,
+        tick_lower_index,
+        tick_upper_index,
+        tick_array_lower_start_index,
+        tick_array_upper_start_index,
+        with_matedata,
+        base_flag,
+    )
+}
+
+pub fn open_position<'a, 'b, 'c: 'info, 'info>(
+    payer: &'b Signer<'info>,
+    position_nft_owner: &'b UncheckedAccount<'info>,
+    position_nft_mint: &'b Box<InterfaceAccount<'info, Mint>>,
+    position_nft_account: &'b Box<InterfaceAccount<'info, TokenAccount>>,
+    metadata_account: &'b UncheckedAccount<'info>,
+    pool_state_loader: &'b AccountLoader<'info, PoolState>,
+    tick_array_lower_loader: &'b UncheckedAccount<'info>,
+    tick_array_upper_loader: &'b UncheckedAccount<'info>,
+    protocol_position: &'b mut Box<Account<'info, ProtocolPositionState>>,
+    personal_position: &'b mut Box<Account<'info, PersonalPositionState>>,
+    token_account_0: &'b Box<InterfaceAccount<'info, TokenAccount>>,
+    token_account_1: &'b Box<InterfaceAccount<'info, TokenAccount>>,
+    token_vault_0: &'b Box<InterfaceAccount<'info, TokenAccount>>,
+    token_vault_1: &'b Box<InterfaceAccount<'info, TokenAccount>>,
+    rent: &'b Sysvar<'info, Rent>,
+    system_program: &'b Program<'info, System>,
+    token_program: &'b Program<'info, Token>,
+    _associated_token_program: &'b Program<'info, AssociatedToken>,
+    metadata_program: &'b Program<'info, Metadata>,
+    token_program_2022: Option<Program<'info, Token2022>>,
+    vault_0_mint: Option<Box<InterfaceAccount<'info, Mint>>>,
+    vault_1_mint: Option<Box<InterfaceAccount<'info, Mint>>>,
+
+    remaining_accounts: &'c [AccountInfo<'info>],
+    protocol_position_bump: u8,
+    personal_position_bump: u8,
+    liquidity: u128,
+    amount_0_max: u64,
+    amount_1_max: u64,
+    tick_lower_index: i32,
+    tick_upper_index: i32,
+    tick_array_lower_start_index: i32,
+    tick_array_upper_start_index: i32,
+    with_matedata: bool,
+    base_flag: Option<bool>,
+) -> Result<()> {
+    let mut liquidity = liquidity;
     {
-        let pool_state = &mut ctx.accounts.pool_state.load_mut()?;
+        let pool_state = &mut pool_state_loader.load_mut()?;
         if !pool_state.get_status_by_bit(PoolStatusBitIndex::OpenPositionOrIncreaseLiquidity) {
             return err!(ErrorCode::NotApproved);
         }
@@ -206,141 +472,204 @@ pub fn open_position<'a, 'b, 'c, 'info>(
         // Beacuse `tick_array_lower` and `tick_array_upper` can be the same account, anchor can initialze tick_array_lower but it causes a crash when anchor to initialze the `tick_array_upper`,
         // the problem is variable scope, tick_array_lower_loader not exit to save the discriminator while build tick_array_upper_loader.
         let tick_array_lower_loader = TickArrayState::get_or_create_tick_array(
-            ctx.accounts.payer.to_account_info(),
-            ctx.accounts.tick_array_lower.to_account_info(),
-            ctx.accounts.system_program.to_account_info(),
-            &ctx.accounts.pool_state,
+            payer.to_account_info(),
+            tick_array_lower_loader.to_account_info(),
+            system_program.to_account_info(),
+            &pool_state_loader,
             tick_array_lower_start_index,
             pool_state.tick_spacing,
         )?;
 
         let tick_array_upper_loader =
             if tick_array_lower_start_index == tick_array_upper_start_index {
-                AccountLoader::<TickArrayState>::try_from(
-                    &ctx.accounts.tick_array_upper.to_account_info(),
-                )?
+                AccountLoad::<TickArrayState>::try_from(&tick_array_upper_loader.to_account_info())?
             } else {
                 TickArrayState::get_or_create_tick_array(
-                    ctx.accounts.payer.to_account_info(),
-                    ctx.accounts.tick_array_upper.to_account_info(),
-                    ctx.accounts.system_program.to_account_info(),
-                    &ctx.accounts.pool_state,
+                    payer.to_account_info(),
+                    tick_array_upper_loader.to_account_info(),
+                    system_program.to_account_info(),
+                    &pool_state_loader,
                     tick_array_upper_start_index,
                     pool_state.tick_spacing,
                 )?
             };
 
         // check if protocol position is initilized
-        if ctx.accounts.protocol_position.pool_id == Pubkey::default() {
-            let protocol_position = &mut ctx.accounts.protocol_position;
-            protocol_position.bump = *ctx.bumps.get("protocol_position").unwrap();
-            protocol_position.pool_id = ctx.accounts.pool_state.key();
+        let protocol_position = protocol_position.deref_mut();
+        if protocol_position.pool_id == Pubkey::default() {
+            protocol_position.bump = protocol_position_bump;
+            protocol_position.pool_id = pool_state_loader.key();
             protocol_position.tick_lower_index = tick_lower_index;
             protocol_position.tick_upper_index = tick_upper_index;
             tick_array_lower_loader
                 .load_mut()?
-                .get_tick_state_mut(tick_lower_index, i32::from(pool_state.tick_spacing))?
+                .get_tick_state_mut(tick_lower_index, pool_state.tick_spacing)?
                 .tick = tick_lower_index;
             tick_array_upper_loader
                 .load_mut()?
-                .get_tick_state_mut(tick_upper_index, i32::from(pool_state.tick_spacing))?
+                .get_tick_state_mut(tick_upper_index, pool_state.tick_spacing)?
                 .tick = tick_upper_index;
         }
 
-        let mut add_liquidity_context = AddLiquidityParam {
-            payer: &ctx.accounts.payer,
-            token_account_0: &mut ctx.accounts.token_account_0,
-            token_account_1: &mut ctx.accounts.token_account_1,
-            token_vault_0: &mut ctx.accounts.token_vault_0,
-            token_vault_1: &mut ctx.accounts.token_vault_1,
-            tick_array_lower: &tick_array_lower_loader,
-            tick_array_upper: &tick_array_upper_loader,
-            protocol_position: &mut ctx.accounts.protocol_position,
-            token_program: ctx.accounts.token_program.clone(),
-        };
+        let use_tickarray_bitmap_extension = pool_state.is_overflow_default_tickarray_bitmap(vec![
+            tick_array_lower_start_index,
+            tick_array_upper_start_index,
+        ]);
 
-        let mut amount_0: u64 = 0;
-        let mut amount_1: u64 = 0;
+        let (amount_0, amount_1, amount_0_transfer_fee, amount_1_transfer_fee) = add_liquidity(
+            payer,
+            token_account_0,
+            token_account_1,
+            token_vault_0,
+            token_vault_1,
+            &tick_array_lower_loader,
+            &tick_array_upper_loader,
+            protocol_position,
+            token_program_2022,
+            token_program,
+            vault_0_mint,
+            vault_1_mint,
+            if use_tickarray_bitmap_extension {
+                require_keys_eq!(
+                    remaining_accounts[0].key(),
+                    TickArrayBitmapExtension::key(pool_state_loader.key())
+                );
+                Some(&remaining_accounts[0])
+            } else {
+                None
+            },
+            pool_state,
+            &mut liquidity,
+            amount_0_max,
+            amount_1_max,
+            tick_lower_index,
+            tick_upper_index,
+            base_flag,
+        )?;
 
-        if liquidity > 0 {
-            (amount_0, amount_1) = add_liquidity(
-                &mut add_liquidity_context,
-                pool_state,
-                liquidity,
-                amount_0_max,
-                amount_1_max,
-                tick_lower_index,
-                tick_upper_index,
-            )?;
-        }
-
-        let personal_position = &mut ctx.accounts.personal_position;
-        personal_position.bump = *ctx.bumps.get("personal_position").unwrap();
-        personal_position.nft_mint = ctx.accounts.position_nft_mint.key();
-        personal_position.pool_id = ctx.accounts.pool_state.key();
+        // let personal_position = &mut personal_position;
+        personal_position.bump = personal_position_bump;
+        personal_position.nft_mint = position_nft_mint.key();
+        personal_position.pool_id = pool_state_loader.key();
         personal_position.tick_lower_index = tick_lower_index;
         personal_position.tick_upper_index = tick_upper_index;
 
-        let updated_protocol_position = add_liquidity_context.protocol_position;
         personal_position.fee_growth_inside_0_last_x64 =
-            updated_protocol_position.fee_growth_inside_0_last_x64;
+            protocol_position.fee_growth_inside_0_last_x64;
         personal_position.fee_growth_inside_1_last_x64 =
-            updated_protocol_position.fee_growth_inside_1_last_x64;
+            protocol_position.fee_growth_inside_1_last_x64;
 
         // update rewards, must update before update liquidity
-        personal_position.update_rewards(updated_protocol_position.reward_growth_inside, false)?;
+        personal_position.update_rewards(protocol_position.reward_growth_inside, false)?;
         personal_position.liquidity = liquidity;
 
         emit!(CreatePersonalPositionEvent {
-            pool_state: ctx.accounts.pool_state.key(),
-            minter: ctx.accounts.payer.key(),
-            nft_owner: ctx.accounts.position_nft_owner.key(),
+            pool_state: pool_state_loader.key(),
+            minter: payer.key(),
+            nft_owner: position_nft_owner.key(),
             tick_lower_index: tick_lower_index,
             tick_upper_index: tick_upper_index,
             liquidity: liquidity,
             deposit_amount_0: amount_0,
             deposit_amount_1: amount_1,
+            deposit_amount_0_transfer_fee: amount_0_transfer_fee,
+            deposit_amount_1_transfer_fee: amount_1_transfer_fee
         });
     }
-
     create_nft_with_metadata(
-        &ctx.accounts.payer.to_account_info(),
-        &ctx.accounts.pool_state,
-        &ctx.accounts.position_nft_mint.to_account_info(),
-        &ctx.accounts.position_nft_account.to_account_info(),
-        &ctx.accounts.metadata_account.to_account_info(),
-        &ctx.accounts.metadata_program.to_account_info(),
-        ctx.accounts.token_program.to_account_info(),
-        ctx.accounts.system_program.to_account_info(),
-        ctx.accounts.rent.to_account_info(),
+        payer,
+        pool_state_loader,
+        position_nft_mint,
+        position_nft_account,
+        metadata_account,
+        metadata_program,
+        token_program,
+        system_program,
+        rent,
+        with_matedata,
     )?;
+
     Ok(())
 }
 
 /// Add liquidity to an initialized pool
-pub fn add_liquidity<'b, 'info>(
-    context: &mut AddLiquidityParam<'b, 'info>,
+pub fn add_liquidity<'b, 'c: 'info, 'info>(
+    payer: &'b Signer<'info>,
+    token_account_0: &'b Box<InterfaceAccount<'info, TokenAccount>>,
+    token_account_1: &'b Box<InterfaceAccount<'info, TokenAccount>>,
+    token_vault_0: &'b Box<InterfaceAccount<'info, TokenAccount>>,
+    token_vault_1: &'b Box<InterfaceAccount<'info, TokenAccount>>,
+    tick_array_lower_loader: &'b AccountLoad<'info, TickArrayState>,
+    tick_array_upper_loader: &'b AccountLoad<'info, TickArrayState>,
+    protocol_position: &mut ProtocolPositionState,
+    token_program_2022: Option<Program<'info, Token2022>>,
+    token_program: &'b Program<'info, Token>,
+    vault_0_mint: Option<Box<InterfaceAccount<'info, Mint>>>,
+    vault_1_mint: Option<Box<InterfaceAccount<'info, Mint>>>,
+    tick_array_bitmap_extension: Option<&'c AccountInfo<'info>>,
     pool_state: &mut RefMut<PoolState>,
-    liquidity: u128,
+    liquidity: &mut u128,
     amount_0_max: u64,
     amount_1_max: u64,
     tick_lower_index: i32,
     tick_upper_index: i32,
-) -> Result<(u64, u64)> {
-    assert!(liquidity > 0);
+    base_flag: Option<bool>,
+) -> Result<(u64, u64, u64, u64)> {
+    if *liquidity == 0 {
+        if base_flag.is_none() {
+            // when establishing a new position , liquidity allows for further additions
+            return Ok((0, 0, 0, 0));
+        }
+        if base_flag.unwrap() {
+            // must deduct transfer fee before calculate liquidity
+            // because only v2 instruction support token_2022, vault_0_mint must be exist
+            let amount_0_transfer_fee =
+                get_transfer_fee(vault_0_mint.clone().unwrap(), amount_0_max).unwrap();
+            *liquidity = liquidity_math::get_liquidity_from_single_amount_0(
+                pool_state.sqrt_price_x64,
+                tick_math::get_sqrt_price_at_tick(tick_lower_index)?,
+                tick_math::get_sqrt_price_at_tick(tick_upper_index)?,
+                amount_0_max.checked_sub(amount_0_transfer_fee).unwrap(),
+            );
+            #[cfg(feature = "enable-log")]
+            msg!(
+                "liquidity: {}, amount_0_max:{}, amount_0_transfer_fee:{}",
+                *liquidity,
+                amount_0_max,
+                amount_0_transfer_fee
+            );
+        } else {
+            // must deduct transfer fee before calculate liquidity
+            // because only v2 instruction support token_2022, vault_1_mint must be exist
+            let amount_1_transfer_fee =
+                get_transfer_fee(vault_1_mint.clone().unwrap(), amount_1_max).unwrap();
+            *liquidity = liquidity_math::get_liquidity_from_single_amount_1(
+                pool_state.sqrt_price_x64,
+                tick_math::get_sqrt_price_at_tick(tick_lower_index)?,
+                tick_math::get_sqrt_price_at_tick(tick_upper_index)?,
+                amount_1_max.checked_sub(amount_1_transfer_fee).unwrap(),
+            );
+            #[cfg(feature = "enable-log")]
+            msg!(
+                "liquidity: {}, amount_1_max:{}, amount_1_transfer_fee:{}",
+                *liquidity,
+                amount_1_max,
+                amount_1_transfer_fee
+            );
+        }
+    }
+    assert!(*liquidity > 0);
     let liquidity_before = pool_state.liquidity;
-    require_keys_eq!(context.tick_array_lower.load()?.pool_id, pool_state.key());
-    require_keys_eq!(context.tick_array_upper.load()?.pool_id, pool_state.key());
+    require_keys_eq!(tick_array_lower_loader.load()?.pool_id, pool_state.key());
+    require_keys_eq!(tick_array_upper_loader.load()?.pool_id, pool_state.key());
 
     // get tick_state
-    let mut tick_lower_state = *context
-        .tick_array_lower
+    let mut tick_lower_state = *tick_array_lower_loader
         .load_mut()?
-        .get_tick_state_mut(tick_lower_index, i32::from(pool_state.tick_spacing))?;
-    let mut tick_upper_state = *context
-        .tick_array_upper
+        .get_tick_state_mut(tick_lower_index, pool_state.tick_spacing)?;
+    let mut tick_upper_state = *tick_array_upper_loader
         .load_mut()?
-        .get_tick_state_mut(tick_upper_index, i32::from(pool_state.tick_spacing))?;
+        .get_tick_state_mut(tick_upper_index, pool_state.tick_spacing)?;
     if tick_lower_state.tick == 0 {
         tick_lower_state.tick = tick_lower_index;
     }
@@ -348,80 +677,117 @@ pub fn add_liquidity<'b, 'info>(
         tick_upper_state.tick = tick_upper_index;
     }
     let clock = Clock::get()?;
-    let (amount_0_int, amount_1_int, flip_tick_lower, flip_tick_upper) = modify_position(
-        i128::try_from(liquidity).unwrap(),
+    let (amount_0, amount_1, flip_tick_lower, flip_tick_upper) = modify_position(
+        i128::try_from(*liquidity).unwrap(),
         pool_state,
-        context.protocol_position.as_mut(),
+        protocol_position,
         &mut tick_lower_state,
         &mut tick_upper_state,
         clock.unix_timestamp as u64,
     )?;
 
     // update tick_state
-    context.tick_array_lower.load_mut()?.update_tick_state(
+    tick_array_lower_loader.load_mut()?.update_tick_state(
         tick_lower_index,
-        i32::from(pool_state.tick_spacing),
+        pool_state.tick_spacing,
         tick_lower_state,
     )?;
-    context.tick_array_upper.load_mut()?.update_tick_state(
+    tick_array_upper_loader.load_mut()?.update_tick_state(
         tick_upper_index,
-        i32::from(pool_state.tick_spacing),
+        pool_state.tick_spacing,
         tick_upper_state,
     )?;
 
     if flip_tick_lower {
-        let mut tick_array_lower = context.tick_array_lower.load_mut()?;
+        let mut tick_array_lower = tick_array_lower_loader.load_mut()?;
         let before_init_tick_count = tick_array_lower.initialized_tick_count;
         tick_array_lower.update_initialized_tick_count(true)?;
 
         if before_init_tick_count == 0 {
-            pool_state.flip_tick_array_bit(tick_array_lower.start_tick_index)?;
+            pool_state.flip_tick_array_bit(
+                tick_array_bitmap_extension,
+                tick_array_lower.start_tick_index,
+            )?;
         }
     }
     if flip_tick_upper {
-        let mut tick_array_upper = context.tick_array_upper.load_mut()?;
+        let mut tick_array_upper = tick_array_upper_loader.load_mut()?;
         let before_init_tick_count = tick_array_upper.initialized_tick_count;
         tick_array_upper.update_initialized_tick_count(true)?;
 
         if before_init_tick_count == 0 {
-            pool_state.flip_tick_array_bit(tick_array_upper.start_tick_index)?;
+            pool_state.flip_tick_array_bit(
+                tick_array_bitmap_extension,
+                tick_array_upper.start_tick_index,
+            )?;
         }
     }
     require!(
-        amount_0_int > 0 || amount_1_int > 0,
+        amount_0 > 0 || amount_1 > 0,
         ErrorCode::ForbidBothZeroForSupplyLiquidity
     );
 
-    let amount_0 = u64::try_from(amount_0_int).unwrap();
-    let amount_1 = u64::try_from(amount_1_int).unwrap();
-
+    let mut amount_0_transfer_fee = 0;
+    let mut amount_1_transfer_fee = 0;
+    if vault_0_mint.is_some() {
+        amount_0_transfer_fee =
+            get_transfer_inverse_fee(vault_0_mint.clone().unwrap(), amount_0).unwrap();
+    };
+    if vault_1_mint.is_some() {
+        amount_1_transfer_fee =
+            get_transfer_inverse_fee(vault_1_mint.clone().unwrap(), amount_1).unwrap();
+    }
+    emit!(LiquidityCalculateEvent {
+        pool_liquidity: liquidity_before,
+        pool_sqrt_price_x64: pool_state.sqrt_price_x64,
+        pool_tick: pool_state.tick_current,
+        calc_amount_0: amount_0,
+        calc_amount_1: amount_1,
+        trade_fee_owed_0: 0,
+        trade_fee_owed_1: 0,
+        transfer_fee_0: amount_0_transfer_fee,
+        transfer_fee_1: amount_1_transfer_fee,
+    });
     #[cfg(feature = "enable-log")]
     msg!(
-        "amount_0:{},amount_1:{},amount_0_max:{},amount_1_max:{}",
+        "amount_0: {}, amount_0_transfer_fee: {}, amount_1: {}, amount_1_transfer_fee: {}",
         amount_0,
+        amount_0_transfer_fee,
         amount_1,
-        amount_0_max,
-        amount_1_max
+        amount_1_transfer_fee
     );
-    require!(
-        amount_0 <= amount_0_max && amount_1 <= amount_1_max,
+    require_gte!(
+        amount_0_max,
+        amount_0 + amount_0_transfer_fee,
         ErrorCode::PriceSlippageCheck
     );
-
+    require_gte!(
+        amount_1_max,
+        amount_1 + amount_1_transfer_fee,
+        ErrorCode::PriceSlippageCheck
+    );
+    let mut token_2022_program_opt: Option<AccountInfo> = None;
+    if token_program_2022.is_some() {
+        token_2022_program_opt = Some(token_program_2022.clone().unwrap().to_account_info());
+    }
     transfer_from_user_to_pool_vault(
-        &context.payer,
-        &context.token_account_0,
-        &context.token_vault_0,
-        &context.token_program,
-        amount_0,
+        payer,
+        token_account_0,
+        token_vault_0,
+        vault_0_mint,
+        &token_program,
+        token_2022_program_opt.clone(),
+        amount_0 + amount_0_transfer_fee,
     )?;
 
     transfer_from_user_to_pool_vault(
-        &context.payer,
-        &context.token_account_1,
-        &context.token_vault_1,
-        &context.token_program,
-        amount_1,
+        payer,
+        token_account_1,
+        token_vault_1,
+        vault_1_mint,
+        &token_program,
+        token_2022_program_opt.clone(),
+        amount_1 + amount_1_transfer_fee,
     )?;
     emit!(LiquidityChangeEvent {
         pool_state: pool_state.key(),
@@ -431,7 +797,12 @@ pub fn add_liquidity<'b, 'info>(
         liquidity_before: liquidity_before,
         liquidity_after: pool_state.liquidity,
     });
-    Ok((amount_0, amount_1))
+    Ok((
+        amount_0,
+        amount_1,
+        amount_0_transfer_fee,
+        amount_1_transfer_fee,
+    ))
 }
 
 pub fn modify_position(
@@ -441,7 +812,7 @@ pub fn modify_position(
     tick_lower_state: &mut TickState,
     tick_upper_state: &mut TickState,
     timestamp: u64,
-) -> Result<(i64, i64, bool, bool)> {
+) -> Result<(u64, u64, bool, bool)> {
     let (flip_tick_lower, flip_tick_upper) = update_position(
         liquidity_delta,
         pool_state,
@@ -550,91 +921,80 @@ pub fn update_position(
 }
 
 const METADATA_URI: &str =
-    "https://cloudflare-ipfs.com/ipfs/QmbzJafuKY3B4t25eq9zdKZMgXiMeW4jHLzf6KE6ZmHWn1/";
-fn get_uri_with_random() -> String {
-    let current_timestamp = u64::try_from(Clock::get().unwrap().unix_timestamp).unwrap();
-    let current_slot = Clock::get().unwrap().slot;
-    // 01 ~ 08
-    let random_num = (current_timestamp + current_slot) % 8 + 1;
-    // https://cloudflare-ipfs.com/ipfs/QmbzJafuKY3B4t25eq9zdKZMgXiMeW4jHLzf6KE6ZmHWn1/01.json
-    let random_str = METADATA_URI.to_string() + "0" + &random_num.to_string() + ".json";
-    random_str
-}
+    "https://dynamic-ipfs.raydium.io/clmm/position?id=9aFsTEEQDvHmnRz5H1kYcvbGQUkJ9YvPamtZ9hox2LZr";
+
 fn create_nft_with_metadata<'info>(
-    payer: &AccountInfo<'info>,
+    payer: &Signer<'info>,
     pool_state_loader: &AccountLoader<'info, PoolState>,
-    position_nft_mint: &AccountInfo<'info>,
-    position_nft_account: &AccountInfo<'info>,
-    metadata_account: &AccountInfo<'info>,
-    metadata_program: &AccountInfo<'info>,
-    token_program: AccountInfo<'info>,
-    system_program: AccountInfo<'info>,
-    rent: AccountInfo<'info>,
+    position_nft_mint: &Box<InterfaceAccount<'info, Mint>>,
+    position_nft_account: &Box<InterfaceAccount<'info, TokenAccount>>,
+    metadata_account: &UncheckedAccount<'info>,
+    metadata_program: &Program<'info, Metadata>,
+    token_program: &Program<'info, Token>,
+    system_program: &Program<'info, System>,
+    rent: &Sysvar<'info, Rent>,
+    with_matedata: bool,
 ) -> Result<()> {
     let pool_state = pool_state_loader.load()?;
-    let seeds = [
-        &POOL_SEED.as_bytes(),
-        pool_state.amm_config.as_ref(),
-        pool_state.token_mint_0.as_ref(),
-        pool_state.token_mint_1.as_ref(),
-        &[pool_state.bump] as &[u8],
-    ];
+    let seeds = pool_state.seeds();
     // Mint the NFT
     token::mint_to(
         CpiContext::new_with_signer(
-            token_program.clone(),
+            token_program.to_account_info(),
             token::MintTo {
-                mint: position_nft_mint.clone(),
-                to: position_nft_account.clone(),
+                mint: position_nft_mint.to_account_info(),
+                to: position_nft_account.to_account_info(),
                 authority: pool_state_loader.to_account_info(),
             },
-            &[&seeds[..]],
+            &[&seeds],
         ),
         1,
     )?;
-    let create_metadata_ix = create_metadata_accounts_v3(
-        metadata_program.key(),
-        metadata_account.key(),
-        position_nft_mint.key(),
-        pool_state_loader.key(),
-        payer.key(),
-        pool_state_loader.key(),
-        String::from("Raydium Concentrated Liquidity"),
-        String::from("RCL"),
-        get_uri_with_random(),
-        Some(vec![Creator {
-            address: pool_state_loader.key(),
-            verified: true,
-            share: 100,
-        }]),
-        0,
-        true,
-        false,
-        None,
-        None,
-        None
-    );
-    solana_program::program::invoke_signed(
-        &create_metadata_ix,
-        &[
-            metadata_account.clone(),
-            position_nft_mint.clone(),
-            payer.to_account_info().clone(),
-            pool_state_loader.to_account_info(),
-            system_program.clone(),
-            rent.clone(),
-        ],
-        &[&seeds[..]],
-    )?;
+    if with_matedata {
+        let create_metadata_ix = create_metadata_accounts_v3(
+            metadata_program.key(),
+            metadata_account.key(),
+            position_nft_mint.key(),
+            pool_state_loader.key(),
+            payer.key(),
+            pool_state_loader.key(),
+            String::from("Raydium Concentrated Liquidity"),
+            String::from("RCL"),
+            METADATA_URI.to_string(),
+            Some(vec![Creator {
+                address: pool_state_loader.key(),
+                verified: true,
+                share: 100,
+            }]),
+            0,
+            true,
+            false,
+            None,
+            None,
+            None,
+        );
+        solana_program::program::invoke_signed(
+            &create_metadata_ix,
+            &[
+                metadata_account.to_account_info(),
+                position_nft_mint.to_account_info(),
+                payer.to_account_info(),
+                pool_state_loader.to_account_info(),
+                system_program.to_account_info(),
+                rent.to_account_info(),
+            ],
+            &[&seeds],
+        )?;
+    }
     // Disable minting
-    token::set_authority(
+    token_2022::set_authority(
         CpiContext::new_with_signer(
-            token_program.clone(),
-            token::SetAuthority {
+            token_program.to_account_info(),
+            token_2022::SetAuthority {
                 current_authority: pool_state_loader.to_account_info(),
-                account_or_mint: position_nft_mint.clone(),
+                account_or_mint: position_nft_mint.to_account_info(),
             },
-            &[&seeds[..]],
+            &[&seeds],
         ),
         AuthorityType::MintTokens,
         None,
